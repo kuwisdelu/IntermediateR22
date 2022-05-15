@@ -1,0 +1,490 @@
+---
+title: "Performance, profiling, and debugging R code"
+author: "Kylie Ariel Bemis"
+date: "16 May 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Case study: finding local maxima
+
+Suppose we want to find the local maxima of a vector, for use in a peak picking function.
+
+```{r message=FALSE}
+library(MSExample) # See "2-OOP" slides if you still need to install MSExample
+set.seed(2020) # set a seed for random number generator
+s <- simSpectra(n=200, by=50, units="ppm") # simulate 100 mass spectra
+
+plot(s[[1]])
+```
+
+## Finding local maxima (version 1)
+
+```{r}
+locmax1 <- function(x, halfWindow = 2) {
+	begin <- halfWindow + 1
+	end <- length(x) - halfWindow
+	out <- integer()
+	if ( begin < 1L || end > length(x) )
+		return(out)
+	for ( i in begin:end ) {
+		j1 <- i - halfWindow
+		j2 <- i + halfWindow
+		is_max <- TRUE
+		for ( j in j1:j2 ) {
+			if ( x[j] > x[i] )
+				is_max <- FALSE
+		}
+		if ( is_max )
+			out <- c(out, i)
+	}
+	out
+}
+```
+
+## Benchmarking `locmax1()`
+
+The `bench` package is useful for accurately benchmarking functions that are intended to be called hundreds or thousands of times.
+
+```{r}
+bench::mark(locmax1 = locmax1(intensity(s[[1]])))
+```
+
+Not bad, but this function may get called thousands of times while processing thousands of spectra.
+
+Can we do better?
+
+## Finding local maxima (version 2)
+
+```{r}
+locmax2 <- function(x, halfWindow = 2) {
+	begin <- halfWindow + 1
+	end <- length(x) - halfWindow
+	if ( begin < 1L || end > length(x) )
+		return(integer())
+	out <- logical(length(x)) # initialize output
+	for ( i in begin:end ) {
+		j1 <- i - halfWindow
+		j2 <- i + halfWindow
+		out[i] <- TRUE
+		for ( j in j1:j2 ) {
+			if ( x[j] > x[i] ) {
+				out[i] <- FALSE    # remove c(x, y) call
+				break
+			}
+		}
+	}
+	which(out)
+}
+```
+
+## Finding local maxima (version 3)
+
+```{r}
+locmax3 <- function(x, halfWindow = 2) {
+	begin <- halfWindow + 1
+	end <- length(x) - halfWindow
+	if ( begin < 1L || end > length(x) )
+		return(integer())
+	out <- vapply(begin:end, function(i) { # remove for loop
+		j1 <- i - halfWindow
+		j2 <- i + halfWindow
+		if ( any(x[j1:j2] > x[i]) ) {
+			FALSE
+		} else {
+			TRUE
+		}
+	}, logical(1))
+	out <- c(rep(FALSE, halfWindow),
+	         out, rep(FALSE, halfWindow))
+	which(out)
+}
+```
+
+## Verify functions
+
+Before comparing our functions, we should make sure they're returning the same results.
+
+```{r}
+all.equal(locmax1(intensity(s[[1]])),
+          locmax2(intensity(s[[1]])))
+
+all.equal(locmax1(intensity(s[[1]])),
+          locmax3(intensity(s[[1]])))
+```
+
+## Benchmark all versions
+
+Which will be fastest?
+
+```{r eval=FALSE}
+bench::mark(locmax1 = locmax1(intensity(s[[1]])),
+            locmax2 = locmax2(intensity(s[[1]])),
+            locmax3 = locmax3(intensity(s[[1]])))
+```
+
+---
+
+
+```{r}
+bench::mark(locmax1 = locmax1(intensity(s[[1]])),
+            locmax2 = locmax2(intensity(s[[1]])),
+            locmax3 = locmax3(intensity(s[[1]])))
+```
+
+
+Version 2 is fastest!
+
+Despite the popular perception, `for` loops in R are not inherently slower than functions like `lapply()`, `sapply()` and `vapply()`.
+
+Version 2 is able to update the output local maxima in place, while exiting the loop early as soon as we know the element is not a peak.
+
+## Performant code
+
+It can be difficult to write high-performance code.
+
+While R is sometimes criticized for being "slow", profiling code can often reveal ways to improve performance dramatically. However, it's not always obvious how to do so.
+
+- Avoid premature optimization
+
+    + Write the function correctly before trying to optimize it
+    
+    + Benchmark and profile your code before trying to optimize it
+    
+    + Our initial intuition of the "optimal" version is often incorrect!
+
+- Use functions that call efficient C code where possible
+
+    + "Native" C code will always be faster than "interpreted" R code
+    
+    + Use functions that call C code rather than pure R implementations where possible
+    
+    + Recognized by functions with calls to `.C`, `.Call`, `.External`, `.Internal`, and `.Primitive` functions
+    
+- Use vectorized code wherever possible
+
+    + Use functions that operate on whole vectors at a time
+    
+    + The `lapply()` family of functions are not "truly" vectorized -- they provide a useful and convenient utility, but must still iterate over each element of the vector
+
+## Avoiding duplication
+
+How does R treat objects that are being modified?
+
+Consider:
+
+```{r}
+x <- runif(10)
+x[5] <- 10
+x
+```
+
+## Understanding memory and allocation in R
+
+What happens to `x`?
+
+```{r}
+x <- runif(10)
+x[5] <- 10
+x
+```
+
+There are two possibilities:
+
+- `x` is modified in place
+- R copies `x` and modifies the copy
+
+
+## Memory tracking in R
+
+We can track when objects are copied by using the `tracemem()` function. It first prints the object's address, and then prints a message every time the traced object is copied.
+
+```{r eval=FALSE}
+x <- runif(10)
+tracemem(x)
+# [1] "0x7fcd419c21c8"
+
+x[5] <- 10
+```
+
+No message is printed. In this case, R is smart and does not make a copy. The object has a single reference (`x`), so it can be modified in place.
+
+Note that running these in RStudio may show different behavior, because RStudio's environment browser makes a reference to all variables in the global environment.
+
+---
+
+What if we create another reference to `x`?
+
+```{r eval=FALSE}
+x <- runif(10)
+tracemem(x)
+# [1] "<0x7fbb5b37e8e8>"
+
+y <- x
+x[5] <- 10
+# tracemem[0x7fbb5b37e8e8 -> 0x7fbb5b37e838]: 
+```
+
+Now there are two references to the object (`x` and `y`) so the `x` must be copied before it can be modified, to avoid affecting `y`.
+
+---
+
+```{r eval=FALSE}
+x <- sample(10)
+typeof(x)
+# [1] "integer"
+
+tracemem(x)
+# [1] "<0x7fbb6b15cb58>"
+
+x[5] <- 10.0
+# tracemem[0x7fbb6b15cb58 -> 0x7fbb6b0ebe48]: 
+```
+
+In this case, even though the object has a single reference (`x`), R must make a copy because the assignment changes the data type (from integer to double).
+
+## Memory tracking with complex objects
+
+Figuring out when complex objects get duplicated can be difficult to figure out. Consider a data frame where we change a single column.
+
+
+```{r eval=FALSE}
+x <- data.frame(matrix(runif(100 * 1e4), ncol = 100))
+
+tracemem(x)
+# [1] "<0x7fbb6af6c290>"
+tracemem(x[[1]])
+# [1] "<0x7fbb31ab8000>"
+
+x[,2] <- runif(nrow(x))
+# tracemem[0x7fbb6af6c290 -> 0x7fbb3c804080]: 
+# tracemem[0x7fbb3c804080 -> 0x7fbb3c8043d0]: [<-.data.frame [<- 
+```
+
+In this case, we see the data frame (`x)`) gets copied even though it has a single reference. But the unmodified columns (such as `x[[1]]`) do not get copied.
+
+This is because R makes a "shallow" copy, so it doesn't have to copy ALL of the columns. Only the "container" data frame is copied, not all the data.
+
+This is relatively efficient, but still less efficient than modifying the data frame object in-place.
+
+---
+
+Consider a simple use case where we modify each column of a data frame in a `for` loop.
+
+```{r eval=FALSE}
+x <- data.frame(matrix(runif(100 * 1e4), ncol = 100))
+medians <- sapply(x, median)
+
+tracemem(x)
+# [1] "<0x7fbb6b81d940>"
+
+for( i in seq_along(medians) )
+  x[,i] <- x[,i] - medians[i]
+# tracemem[0x7fbb6b81d940 -> 0x7fbb3c805510]: [<-.data.frame [<- 
+# tracemem[0x7fbb3c805510 -> 0x7fbb3c805860]: [<-.data.frame [<- 
+# tracemem[0x7fbb3c805860 -> 0x7fbb3c805bb0]: [<-.data.frame [<- 
+# tracemem[0x7fbb3c805bb0 -> 0x7fbb3c819d00]: [<-.data.frame [<- 
+# ...
+```
+
+In this case, a shallow copy of the data frame is made at each iteration.
+
+This is because the `[<-` method for data frames is a regular R function that makes non-trivial modifications to the entire object.
+
+---
+
+The `[<-` method for lists is a simpler, "primitive" function (implemented in C), so it doesn't make a copy at every iteration.
+
+```{r eval=FALSE}
+y <- as.list(x)
+# tracemem[0x7fbb3c819d00 -> 0x7fbb3c81a050]: as.list.data.frame as.list 
+
+tracemem(y)
+# [1] "<0x7fbb3c81a050>"
+
+for(i in seq_along(medians))
+  y[[i]] <- y[[i]] - medians[i]
+```
+
+While it's generally preferable to avoid creating unnecessary duplicates of objects, it can be surprisingly difficult to determine exactly when objects get copied. How do we know when it's worth it?
+
+---
+
+We can compare the impact of the shallow copies:
+
+```{r}
+x <- data.frame(matrix(runif(100 * 1e4), ncol = 100))
+medians <- sapply(x, median)
+
+y <- as.list(x)
+
+bench::mark(
+  df = for(i in seq_along(medians)) x[,i] <- x[,i] - medians[i],
+  list = for(i in seq_along(medians)) y[[i]] <- y[[i]] - medians[i])
+```
+
+In this case, converting to a list to use a primitive replacement function saves some time, but it isn't clear whether it's worth it. In particular, because the copies are "shallow", it doesn't save very much memory.
+
+In general, it is always best to avoid premature optimization until you have identified the bottlenecks.
+
+
+## Tips for avoiding duplication
+
+- Use "primitive" replacement functions when possible
+
+- Always pre-allocate a vector/ matrix before looping over it
+
+    + Use `numeric()` or `matrix()` before the loop
+
+    + Avoid using `c()` or `rbind()`/`cbind()` to append results together
+
+- Modify an vector/matrix as early as possible after creating it
+
+- Use `tracemem()` to track when objects get copied and rewrite to avoid it
+
+
+## Useful debugging tools
+
+A major problem with programming is you almost never do something correctly the first time.
+
+That's why debugging is important. R provides several tools for debugging.
+
+- `traceback()`
+    + Prints the stack at the time the error occurred
+
+- `browser()`
+    + Creates a pseudo-breakpoint that allows you to jump into code at a particular point
+
+- `options(error=recover)`
+    + Allows you to enter the `browser` anywhere on the stack after an error occurs
+
+- `debug()` and `undebug()`
+    + Enters `browser` at the beginning of a particular function call
+    
+## Understanding the `traceback()`
+
+Understanding *where* an error occured is generally the first step in debugging.
+
+Examining the traceback can give us a hint of where the error occured.
+
+```{r error=TRUE}
+f <- function(a) g(a)
+g <- function(b) h(b)
+h <- function(c) i(c)
+i <- function(d) "a" + d
+f(10)
+```
+
+Either calling `traceback()` or clicking "Show Traceback" in RStudio will print the *call stack*.
+
+## Understanding the call stack
+
+The call stack can be read from bottom to top:
+
+```{r eval=FALSE}
+traceback()
+# 4: i(c) at #1
+# 3: h(b) at #1
+# 2: g(a) at #1
+# 1: f(10)
+```
+
+First `f(10)` was called, then `g(a)`, then `h(b)`, then `i(c)`.
+
+This tells us that `i(c)` is where the actual error occured, but the cause of the error may have been earlier.
+
+Sometimes knowing where the error occured is enough to reason what the cause of the bug, but often the traceback isn't enough on its own.
+
+## The debugger in R
+
+Either manually adding `browser()` or using `debug()` on a function will put you in a debugging mode. RStudio provides a visual interface for stepping through the functions. These are also available as commands outside RStudio.
+
+- `n` : Execute the next line
+
+- `s` : Execute the next line and step into it if it's a function
+
+- `f` : Finish execution of current loop or function
+
+- `c` : Continue execution, exiting interactive debugging mode
+
+- `Q` : Quit debugging mode without continuing execution
+
+Using `options(error=recover)` also allows you to enter debugging mode anywhere in the stack after an error has occured.
+
+Also note that if you need to debug warnings rather than errors, it is useful to convert them into errors using `options(warn = 2)`.
+
+Use `options(warn = 0)` to return to the default behavior.
+
+## Debugging our call stack
+
+Using `debug()` or `options(error=recover)` are the simplest ways to begin debugging.
+
+We can debug `i()` specifically by using `debug()` or clicking "Rerun with Debug" in RStudio:
+
+```{r eval=FALSE}
+debug(i)
+f(10)
+undebug(i)
+```
+
+Or we can jump into any function in the call stack after the error occured by using `options(error=recover)`
+
+```{r eval=FALSE}
+options(error=recover)
+f(10)
+options(error=NULL)
+```
+
+## Debugging S4 methods
+
+S4 methods can be difficult to debug with `debug()`, because using `debug()` on the generic function will only debug the generic function, without letting you enter the actual method.
+
+Use the `signature` parameter to define the signature for the S4 method you want to debug to debug the actual method instead.
+
+```{r eval=FALSE}
+debug(plot, signature=c("MassSpectrum", "missing"))
+```
+
+## Defensive programming
+
+Debugging error-prone functions can be excessively difficult and is one of the most frustrating aspect of programming.
+
+There are some "defensive programming" techniques you can make your life easier by avoiding common bugs and making your functions easier to debug when you do encounter bugs.
+
+- "Fail fast" and "fail early"
+
+    + It is better for a function to fail as soon as it receives bad input rather than propogate that bad input
+    
+    + Check whether the arguments passed to your function are valid values for those arguments -- immediately `stop()` with an appropriate message if your input isn't valid
+
+## Defensive programming (cont'd)
+
+- Write short, simple functions that do one thing
+
+    + Longer functions that do many things and handle multiple input types are more error-prone
+    
+    + Shorter, simpler functions are easier to jump into and `debug()`
+
+- Avoid non-standard evaluation (NSE) when writing functions
+
+    + Functions that use NSE like `base::subset()` or `dplyr::filter()` are convenient for top-level interactive data analysis, but can be extremely difficult to debug when used inside functions
+    
+    + Use simpler functions that use standard evaluation and ordinary subsetting operators like `[` and `[[`
+    
+- Avoid functions that may return different types of values
+
+    + Use `lapply()` or `vapply()` rather than `sapply()`
+    
+    + Always specify `drop=FALSE` when subsetting with `[`
+
+- Wrap error-prone code in `try()` or `tryCatch()`
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
